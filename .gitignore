@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data & model
+data/
+dataset/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+output/
+
+script
+run_via_slurm
+*.out
+gpu_status.txt
