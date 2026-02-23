@@ -3,8 +3,6 @@ __pycache__/
 *.pyc
 
 # Data & model
-data/
-dataset/
 checkpoints/
 *.pt
 *.pth
