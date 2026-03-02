@@ -15,7 +15,5 @@ checkpoints/
 logs/
 output/
 
-script
-run_via_slurm
 *.out
 gpu_status.txt

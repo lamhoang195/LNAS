@@ -1,0 +1,54 @@
+#!/bin/bash
+#SBATCH --job-name=linear # define job name
+#SBATCH --exclude=node00[2-3]    # define node
+#SBATCH --gpus-per-node=1     # define gpu limmit in 1 node
+#SBATCH --ntasks=1            # define number tasks
+#SBATCH --cpus-per-task=24    # There are 24 CPU cores
+#SBATCH --time=1-20:10:00     # Max running time = 40 days
+#SBATCH --output=slurm-script-%j.out
+while true; do nvidia-smi > gpu_status.txt; sleep 5; done &
+
+module load shared conda
+. $CONDAINIT
+conda activate linear
+module load shared
+
+export CUDA_VISIBLE_DEVICES=0
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "------Starting training---------"
+
+# Paths relative to LNAS root (parent of linear_probe/)
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+LNAS_DIR=$(dirname "$SCRIPT_DIR")
+cd "$LNAS_DIR"
+
+TRAIN_DATA="data/train"
+CHECKPOINT="checkpoints/best_probe.pt"
+MODEL="meta-llama/Llama-3.1-8B-Instruct"
+
+echo "Working dir: $LNAS_DIR"
+echo "Model      : $MODEL"
+echo "Train data : $TRAIN_DATA"
+
+python linear_probe/train.py \
+    --model       "$MODEL" \
+    --train-data  "$TRAIN_DATA" \
+    --epochs      20 \
+    --batch-size  4 \
+    --window-size 16 \
+    --temperature 1.0
+
+echo "------End training-------"
+echo "------Starting evaluation--------"
+
+python linear_probe/eval.py \
+    --checkpoint  "$CHECKPOINT" \
+    --train-data  "$TRAIN_DATA" \
+    --batch-size  4
+
+echo "------End evaluation-------"
+echo "Exit worker node"
+sleep 20
+

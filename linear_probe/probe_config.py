@@ -5,17 +5,17 @@ import json, os
 @dataclass
 class ProbeConfig:
     # Model
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
-    dtype: str = "float16"
-    max_sequence_length: int = 4096
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    dtype: str = "bfloat16"
+    max_sequence_length: int = 16384
     device: str = "cuda"
 
     # Probe: trống là probe trên tất cả các layer, nếu có thì chỉ probe trên các layer được chỉ định
     layers: List[int] = field(default_factory=list)
 
     # Data
-    train_file: str = "data/train/train.json"
-    eval_file: str = "data/eval/eval.json"
+    train_file: str = "data/train/"
+    eval_file: str = ""  # empty → auto 80/20 split per file from train_file
     cache_root: str = "activation_cache"
     
     # Training hyperparameters
@@ -31,10 +31,13 @@ class ProbeConfig:
     save_dir: str = "checkpoints"
     early_stop_patience: int = 5
 
+    # Eval
+    eval_interval: int = 1  # run eval every N epochs
+
     # Inference
     ema_alpha: float = 0.1
     threshold: float = 0.5
-    checkpoint_path: str = "checkpoints/best_model.pt"
+    checkpoint_path: str = "checkpoints/linear_probe_model.pt"
 
     log_dir: str = "logs"
 
