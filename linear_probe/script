@@ -34,14 +34,15 @@ echo "Model      : $MODEL"
 echo "Train data : $TRAIN_DATA"
 
 python linear_probe/train.py \
-    --model       "$MODEL" \
-    --train-data  "$TRAIN_DATA" \
-    --epochs      20 \
-    --batch-size  4 \
-    --window-size 16 \
-    --temperature 1.0 \
-    --train-ratio 0.40 \
-    --eval-ratio  0.20
+    --model              "$MODEL" \
+    --train-data         "$TRAIN_DATA" \
+    --epochs             20 \
+    --batch-size         32 \
+    --cache-batch-size   8 \
+    --window-size        16 \
+    --temperature        1.0 \
+    --train-ratio        0.40 \
+    --eval-ratio         0.20
 
 echo "------End training-------"
 echo "------Starting evaluation--------"
@@ -49,7 +50,7 @@ echo "------Starting evaluation--------"
 python linear_probe/eval.py \
     --checkpoint  "$CHECKPOINT" \
     --train-data  "$TRAIN_DATA" \
-    --batch-size  4
+    --batch-size  32
 
 echo "------End evaluation-------"
 echo "Exit worker node"

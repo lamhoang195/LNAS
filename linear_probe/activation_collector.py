@@ -103,40 +103,51 @@ def cached_collate_fn(batch):
     }
 
 
+def _item_to_text(tokenizer, item) -> str:
+    """Convert a data item to a single string using the tokenizer's chat template."""
+    messages = item["messages"]
+    has_response = messages and messages[-1]["role"] == "assistant"
+    if hasattr(tokenizer, "apply_chat_template"):
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False,
+            add_generation_prompt=not has_response,
+        )
+    return " ".join(m["content"] for m in messages)
+
+
 @torch.no_grad()
 def precompute_activations(
     model, tokenizer, data, target_layers,
-    cache_dir, max_length=2048, multi_layer=True,
+    cache_dir, max_length=2048, multi_layer=True, batch_size=8,
 ):
-    """Pre-compute and cache activations for the dataset."""
+    """Pre-compute and cache activations for the dataset (batched)."""
     collector = ActivationCollector(model, target_layers)
     cache = ActivationCache(cache_dir)
 
-    for idx, item in enumerate(tqdm(data, desc="Caching activations")):
-        if cache.exists(idx):
-            continue
+    # Only process samples that are not yet cached
+    pending = [(idx, item) for idx, item in enumerate(data) if not cache.exists(idx)]
+    if not pending:
+        print(f"All {cache.count()} samples already cached in {cache_dir}")
+        return
 
-        messages = item["messages"]
-        # Determine whether the last turn is an assistant reply.
-        has_response = messages and messages[-1]["role"] == "assistant"
+    n_batches = (len(pending) + batch_size - 1) // batch_size
+    for b in tqdm(range(n_batches), desc="Caching activations"):
+        chunk = pending[b * batch_size:(b + 1) * batch_size]
+        texts = [_item_to_text(tokenizer, item) for _, item in chunk]
 
-        if hasattr(tokenizer, "apply_chat_template"):
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False,
-                add_generation_prompt=not has_response,
-            )
-        else:
-            # Fallback: concatenate all content fields
-            text = " ".join(m["content"] for m in messages)
-
-        enc = tokenizer(text, return_tensors="pt", max_length=max_length, truncation=True)
+        enc = tokenizer(
+            texts, return_tensors="pt", max_length=max_length,
+            truncation=True, padding=True,
+        )
+        # features: (B, T, D)
         features = collector.collect(enc["input_ids"], enc["attention_mask"], multi_layer)
 
-        cache.save(
-            activations=features.squeeze(0),
-            attention_mask=enc["attention_mask"].squeeze(0),
-            label=torch.tensor(item["label"], dtype=torch.float32),
-            idx=idx,
-        )
+        for i, (idx, item) in enumerate(chunk):
+            cache.save(
+                activations=features[i],
+                attention_mask=enc["attention_mask"][i],
+                label=torch.tensor(item["label"], dtype=torch.float32),
+                idx=idx,
+            )
 
     print(f"Cached {cache.count()} samples to {cache_dir}")

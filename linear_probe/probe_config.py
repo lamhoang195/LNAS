@@ -18,6 +18,9 @@ class ProbeConfig:
     eval_file: str = ""  # empty → auto split per file from train_file
     train_ratio: float = 0.80   # fraction of each file used for training
     eval_ratio:  float = 0.20   # fraction of each file used for evaluation
+    max_train_samples: int = -1  # -1 = no cap
+    max_eval_samples:  int = -1  # -1 = no cap
+    cache_batch_size:  int = 8   # batch size for activation caching (LLM forward pass)
     cache_root: str = "activation_cache"
     
     # Training hyperparameters

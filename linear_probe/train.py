@@ -75,7 +75,15 @@ def train(config: ProbeConfig):
         )
     print(f"  Train: {len(train_data)} | Eval: {len(eval_data)}")
 
-    # 3. Cache activations
+    # Cap sample counts if requested
+    if config.max_train_samples > 0:
+        random.shuffle(train_data)
+        train_data = train_data[:config.max_train_samples]
+    if config.max_eval_samples > 0:
+        random.shuffle(eval_data)
+        eval_data = eval_data[:config.max_eval_samples]
+    if config.max_train_samples > 0 or config.max_eval_samples > 0:
+        print(f"  After cap → Train: {len(train_data)} | Eval: {len(eval_data)}")
     multi_layer = len(config.layers) != 1
     train_cache = os.path.join(config.cache_root, "train")
     eval_cache = os.path.join(config.cache_root, "eval")
@@ -86,6 +94,7 @@ def train(config: ProbeConfig):
         precompute_activations(
             model, tokenizer, data, config.layers,
             cdir, config.max_sequence_length, multi_layer,
+            batch_size=config.cache_batch_size,
         )
 
     del model
@@ -94,11 +103,11 @@ def train(config: ProbeConfig):
     # 4. Dataloaders
     train_loader = DataLoader(
         CachedActivationDataset(train_cache), batch_size=config.batch_size,
-        shuffle=True, collate_fn=cached_collate_fn, num_workers=2, pin_memory=True,
+        shuffle=True, collate_fn=cached_collate_fn, num_workers=8, pin_memory=True,
     )
     eval_loader = DataLoader(
         CachedActivationDataset(eval_cache), batch_size=config.batch_size,
-        shuffle=False, collate_fn=cached_collate_fn, num_workers=2, pin_memory=True,
+        shuffle=False, collate_fn=cached_collate_fn, num_workers=8, pin_memory=True,
     )
 
     # 5. Probe + optimizer
@@ -189,8 +198,11 @@ if __name__ == "__main__":
     parser.add_argument("--train-data", type=str, default=None)
     parser.add_argument("--eval-data", type=str, default=None)
     parser.add_argument("--train-ratio", type=float, default=None)
-    parser.add_argument("--eval-ratio", type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--eval-ratio",  type=float, default=None)
+    parser.add_argument("--max-train-samples",  type=int,   default=None)
+    parser.add_argument("--max-eval-samples",   type=int,   default=None)
+    parser.add_argument("--cache-batch-size",   type=int,   default=None)
+    parser.add_argument("--batch-size",         type=int,   default=None)
     args = parser.parse_args()
 
     cfg = ProbeConfig.load(args.config) if args.config else ProbeConfig()
@@ -202,9 +214,12 @@ if __name__ == "__main__":
     if args.temperature: cfg.temperature = args.temperature
     if args.train_data:  cfg.train_file   = args.train_data
     if args.eval_data:   cfg.eval_file    = args.eval_data
-    if args.train_ratio: cfg.train_ratio  = args.train_ratio
-    if args.eval_ratio:  cfg.eval_ratio   = args.eval_ratio
-    if args.batch_size:  cfg.batch_size   = args.batch_size
+    if args.train_ratio:        cfg.train_ratio        = args.train_ratio
+    if args.eval_ratio:         cfg.eval_ratio         = args.eval_ratio
+    if args.max_train_samples:  cfg.max_train_samples  = args.max_train_samples
+    if args.max_eval_samples:   cfg.max_eval_samples   = args.max_eval_samples
+    if args.cache_batch_size:   cfg.cache_batch_size   = args.cache_batch_size
+    if args.batch_size:         cfg.batch_size         = args.batch_size
 
     train(cfg)
 
