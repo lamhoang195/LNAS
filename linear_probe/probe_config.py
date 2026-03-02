@@ -15,7 +15,9 @@ class ProbeConfig:
 
     # Data
     train_file: str = "data/train/"
-    eval_file: str = ""  # empty → auto 80/20 split per file from train_file
+    eval_file: str = ""  # empty → auto split per file from train_file
+    train_ratio: float = 0.80   # fraction of each file used for training
+    eval_ratio:  float = 0.20   # fraction of each file used for evaluation
     cache_root: str = "activation_cache"
     
     # Training hyperparameters

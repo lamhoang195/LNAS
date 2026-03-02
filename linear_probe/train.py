@@ -66,9 +66,12 @@ def train(config: ProbeConfig):
         train_data = load_data(config.train_file)
         eval_data = load_data(config.eval_file)
     else:
-        # Per-file 80/20 split from train directory
+        # Per-file split from train directory
         train_data, eval_data = load_data_split(
-            config.train_file, eval_ratio=0.20, seed=config.seed
+            config.train_file,
+            train_ratio=config.train_ratio,
+            eval_ratio=config.eval_ratio,
+            seed=config.seed,
         )
     print(f"  Train: {len(train_data)} | Eval: {len(eval_data)}")
 
@@ -185,6 +188,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--train-data", type=str, default=None)
     parser.add_argument("--eval-data", type=str, default=None)
+    parser.add_argument("--train-ratio", type=float, default=None)
+    parser.add_argument("--eval-ratio", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     args = parser.parse_args()
 
@@ -195,9 +200,11 @@ if __name__ == "__main__":
     if args.lr: cfg.learning_rate = args.lr
     if args.window_size: cfg.window_size = args.window_size
     if args.temperature: cfg.temperature = args.temperature
-    if args.train_data: cfg.train_file = args.train_data
-    if args.eval_data: cfg.eval_file = args.eval_data
-    if args.batch_size: cfg.batch_size = args.batch_size
+    if args.train_data:  cfg.train_file   = args.train_data
+    if args.eval_data:   cfg.eval_file    = args.eval_data
+    if args.train_ratio: cfg.train_ratio  = args.train_ratio
+    if args.eval_ratio:  cfg.eval_ratio   = args.eval_ratio
+    if args.batch_size:  cfg.batch_size   = args.batch_size
 
     train(cfg)
 

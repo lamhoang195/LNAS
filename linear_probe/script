@@ -19,13 +19,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo "------Starting training---------"
 
-# Paths relative to LNAS root (parent of linear_probe/)
-SCRIPT_DIR=$(dirname "$(realpath "$0")")
-LNAS_DIR=$(dirname "$SCRIPT_DIR")
+# SLURM copies the script to its spool dir, so realpath "$0" won't work.
+# The script lives inside linear_probe/, so SLURM_SUBMIT_DIR is that subdir.
+# Go one level up to reach the LNAS root.
+LNAS_DIR="$(dirname "${SLURM_SUBMIT_DIR}")"
 cd "$LNAS_DIR"
 
 TRAIN_DATA="data/train"
-CHECKPOINT="checkpoints/best_probe.pt"
+CHECKPOINT="checkpoints/linear_probe_model.pt"
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 
 echo "Working dir: $LNAS_DIR"
@@ -38,7 +39,9 @@ python linear_probe/train.py \
     --epochs      20 \
     --batch-size  4 \
     --window-size 16 \
-    --temperature 1.0
+    --temperature 1.0 \
+    --train-ratio 0.40 \
+    --eval-ratio  0.20
 
 echo "------End training-------"
 echo "------Starting evaluation--------"

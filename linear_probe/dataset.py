@@ -46,12 +46,16 @@ def load_data(data_dir: str) -> List[Dict]:
 
 
 def load_data_split(
-    data_dir: str, eval_ratio: float = 0.20, seed: int = 42
+    data_dir: str,
+    train_ratio: float = 0.80,
+    eval_ratio: float = 0.20,
+    seed: int = 42,
 ) -> Tuple[List, List]:
     """Load all .jsonl files and split **per-file** into train/eval.
 
-    Each file contributes exactly (1-eval_ratio)*100% to train and
-    eval_ratio*100% to eval, so every file is represented in both sets.
+    Each file contributes train_ratio*100% to train and eval_ratio*100%
+    to eval (the remaining fraction is discarded), so every file is
+    represented in both sets.
     Returns (train_data, eval_data).
     """
     rng = random.Random(seed)
@@ -78,11 +82,12 @@ def load_data_split(
             continue
 
         rng.shuffle(file_items)
-        n_eval = max(1, int(len(file_items) * eval_ratio))
+        n_eval  = max(1, int(len(file_items) * eval_ratio))
+        n_train = int(len(file_items) * train_ratio)
         eval_all.extend(file_items[:n_eval])
-        train_all.extend(file_items[n_eval:])
+        train_all.extend(file_items[n_eval:n_eval + n_train])
 
-        print(f"  {fname}: {len(file_items) - n_eval} train / {n_eval} eval")
+        print(f"  {fname}: {n_train} train / {n_eval} eval (of {len(file_items)} total)")
 
     rng.shuffle(train_all)
     rng.shuffle(eval_all)
