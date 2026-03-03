@@ -41,8 +41,8 @@ python linear_probe/train.py \
     --cache-batch-size   8 \
     --window-size        16 \
     --temperature        1.0 \
-    --train-ratio        0.40 \
-    --eval-ratio         0.20
+    --train-ratio        0.20 \
+    --eval-ratio         0.10
 
 echo "------End training-------"
 echo "------Starting evaluation--------"

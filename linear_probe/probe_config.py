@@ -39,9 +39,17 @@ class ProbeConfig:
     # Eval
     eval_interval: int = 1  # run eval every N epochs
 
+    # Gating mode (Tầng 1 → kích hoạt AlphaSteer tầng 2)
+    # Khi gate_mode=True: probe dùng ngưỡng thấp (high-recall) để gating AlphaSteer.
+    # AlphaSteer null-space projection xử lý false positive nên ưu tiên recall.
+    gate_mode: bool = False
+    gate_threshold: float = 0.3          # θ_1 thấp → high recall, AlphaSteer lo false positive
+    recall_penalty_weight: float = 0.5   # β weight cho recall penalty loss
+    use_cummax_inference: bool = True    # gate_mode dùng cummax (không bỏ sót); detection dùng EMA
+
     # Inference
     ema_alpha: float = 0.1
-    threshold: float = 0.5
+    threshold: float = 0.5               # Ngưỡng detection khi gate_mode=False
     checkpoint_path: str = "checkpoints/linear_probe_model.pt"
 
     log_dir: str = "logs"

@@ -46,7 +46,10 @@ class SwIMSmoother(nn.Module):
 
 
 class EMASmoother:
-    """Exponential Moving Average smoother for inference (O(1) memory)."""
+    """Exponential Moving Average smoother for inference (O(1) memory).
+
+    Dùng cho detection mode: giảm false positive bằng cách làm mượt.
+    """
 
     def __init__(self, alpha: float = 0.1):
         self.alpha = alpha
@@ -60,3 +63,25 @@ class EMASmoother:
         self.value = self.alpha * logit + (1 - self.alpha) * self.value
         prob = torch.sigmoid(torch.tensor(self.value)).item()
         return self.value, prob
+
+
+class CumMaxSmoother:
+    """Cumulative Maximum smoother cho gating mode (O(1) memory).
+
+    Dùng cho gate_mode=True: xác suất chỉ tăng, không giảm → không bỏ sót.
+    p_t = max_{τ≤t} σ(z̄_τ)
+    Phù hợp vì AlphaSteer null-space projection lo false positive,
+    ưu tiên của tầng 1 là không bỏ sót jailbreak.
+    """
+
+    def __init__(self):
+        self.max_prob = 0.0
+
+    def reset(self):
+        self.max_prob = 0.0
+
+    def update(self, logit: float) -> tuple:
+        """Returns (cumulative_max_prob, gate_triggered)."""
+        prob = torch.sigmoid(torch.tensor(logit)).item()
+        self.max_prob = max(self.max_prob, prob)
+        return self.max_prob, self.max_prob

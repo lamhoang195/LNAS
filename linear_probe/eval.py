@@ -20,10 +20,13 @@ def evaluate_probe(
     device: torch.device,
     window_size: int = 16,
     threshold: float = 0.5,
+    gate_mode: bool = False,
 ) -> Dict[str, float]:
     """
     Exchange-level prediction: max smoothed probability over valid positions.
     Flagged as harmful if max probability >= threshold at any point.
+
+    gate_mode=True: dùng threshold thấp hơn, ưu tiên recall cho Tầng 1.
     """
     probe.eval()
     all_probs, all_labels = [], []
@@ -58,12 +61,29 @@ def evaluate_probe(
 
 
 def find_optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
-    """Find threshold maximizing F1."""
+    """Find threshold maximizing F1 (detection mode)."""
     best_f1, best_t = 0.0, 0.5
     for t in np.arange(0.1, 0.95, 0.01):
         f1 = f1_score(labels, (probs >= t).astype(int), zero_division=0)
         if f1 > best_f1:
             best_f1, best_t = f1, t
+    return best_t
+
+
+def find_gate_threshold(
+    probs: np.ndarray, labels: np.ndarray,
+    min_recall: float = 0.95,
+) -> float:
+    """Tìm threshold cao nhất mà vẫn đảm bảo recall >= min_recall (gate mode).
+
+    Gate mode ưu tiên recall: chọn ngưỡng cao nhất thoả recall >= min_recall.
+    Ngưỡng cao hơn → ít false positive hơn → AlphaSteer được gọi ít hơn.
+    """
+    best_t = 0.1
+    for t in np.arange(0.1, 0.90, 0.01):
+        rec = recall_score(labels, (probs >= t).astype(int), zero_division=0)
+        if rec >= min_recall:
+            best_t = t  # giữ ngưỡng cao nhất thỏa mãn
     return best_t
 
 
@@ -155,10 +175,13 @@ if __name__ == "__main__":
     probs  = torch.cat(all_probs).numpy()
     labels = torch.cat(all_labels).numpy()
 
+    from sklearn.metrics import precision_score, recall_score, f1_score
+
     # 5. Metrics at fixed threshold
     threshold = args.threshold if args.threshold is not None else cfg.threshold
     metrics = evaluate_probe(probe, smoother, eval_loader, device,
-                             ckpt["window_size"], threshold)
+                             ckpt["window_size"], threshold,
+                             gate_mode=ckpt.get("gate_mode", False))
     print(f"\n=== Eval @ threshold={threshold:.2f} ===")
     print(f"  Accuracy : {metrics['accuracy']:.4f}")
     print(f"  Precision: {metrics['precision']:.4f}")
@@ -169,7 +192,17 @@ if __name__ == "__main__":
     # 6. Find optimal threshold
     opt_t = find_optimal_threshold(probs, labels)
     opt_preds = (probs >= opt_t).astype(int)
-    print(f"\n=== Optimal threshold={opt_t:.2f} ===")
+    print(f"\n=== Optimal F1 threshold={opt_t:.2f} ===")
     print(f"  Precision: {precision_score(labels, opt_preds, zero_division=0):.4f}")
     print(f"  Recall   : {recall_score(labels, opt_preds, zero_division=0):.4f}")
     print(f"  F1       : {f1_score(labels, opt_preds, zero_division=0):.4f}")
+
+    # 7. Gate threshold recommendation (gate_mode)
+    if ckpt.get("gate_mode", False):
+        gate_t = find_gate_threshold(probs, labels, min_recall=0.95)
+        gate_preds = (probs >= gate_t).astype(int)
+        print(f"\n=== Gate threshold (recall ≥0.95) = {gate_t:.2f} ===")
+        print(f"  Precision: {precision_score(labels, gate_preds, zero_division=0):.4f}")
+        print(f"  Recall   : {recall_score(labels, gate_preds, zero_division=0):.4f}")
+        print(f"  F1       : {f1_score(labels, gate_preds, zero_division=0):.4f}")
+        print(f"  → Dùng gate_threshold={gate_t:.2f} khi deploy AlphaSteer (Tầng 2)")

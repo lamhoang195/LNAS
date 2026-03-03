@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from probe_config import ProbeConfig
 from model import LinearProbe, SwIMSmoother
-from sw_loss import SoftmaxWeightedBCELoss
+from sw_loss import SoftmaxWeightedBCELoss, GatingLoss
 from activation_collector import (
     CachedActivationDataset, cached_collate_fn, precompute_activations,
 )
@@ -116,7 +116,17 @@ def train(config: ProbeConfig):
 
     probe = LinearProbe(hidden_dim).to(device)
     smoother = SwIMSmoother(config.window_size).to(device)
-    criterion = SoftmaxWeightedBCELoss(config.temperature, config.window_size)
+    if config.gate_mode:
+        # Tầng 1 gating: SWiM BCE + recall penalty → high recall probe
+        criterion = GatingLoss(
+            config.temperature, config.window_size,
+            config.recall_penalty_weight, config.gate_threshold,
+        )
+        print(f"  Gate mode: recall_penalty_weight={config.recall_penalty_weight}, "
+              f"gate_threshold={config.gate_threshold}")
+    else:
+        # Detection mode: SWiM BCE chuẩn
+        criterion = SoftmaxWeightedBCELoss(config.temperature, config.window_size)
 
     optimizer = AdamW(probe.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     total_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
@@ -156,7 +166,8 @@ def train(config: ProbeConfig):
         # Evaluate
         if (epoch + 1) % config.eval_interval == 0:  # eval_interval from ProbeConfig
             metrics = evaluate_probe(
-                probe, smoother, eval_loader, device, config.window_size)
+                probe, smoother, eval_loader, device,
+                config.window_size, gate_mode=config.gate_mode)
             print(f"  Eval - Acc: {metrics['accuracy']:.4f} | "
                   f"F1: {metrics['f1']:.4f} | Prec: {metrics['precision']:.4f} | "
                   f"Rec: {metrics['recall']:.4f} | AUROC: {metrics['auroc']:.4f}")
@@ -172,6 +183,9 @@ def train(config: ProbeConfig):
                     "window_size": config.window_size,
                     "best_f1": best_f1,
                     "epoch": epoch + 1,
+                    # Gating mode metadata
+                    "gate_mode": config.gate_mode,
+                    "gate_threshold": config.gate_threshold,
                 }, os.path.join(config.save_dir, "best_probe.pt"))
                 print(f"  New best F1: {best_f1:.4f}")
             else:
@@ -220,7 +234,5 @@ if __name__ == "__main__":
     if args.max_eval_samples:   cfg.max_eval_samples   = args.max_eval_samples
     if args.cache_batch_size:   cfg.cache_batch_size   = args.cache_batch_size
     if args.batch_size:         cfg.batch_size         = args.batch_size
-
-    train(cfg)
 
     train(cfg)
