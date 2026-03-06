@@ -44,53 +44,106 @@ class SoftmaxWeightedBCELoss(nn.Module):
         return (weights * bce).sum(dim=1).mean()
 
 
-class GatingLoss(nn.Module):
-    """Loss cho gating mode (Tầng 1): SoftmaxWeightedBCE + Recall Penalty.
+class CumulativeMaxLoss(nn.Module):
+    """Cumulative maximum loss (Section C.1).
 
-    Recall penalty buộc probe luôn gắn cờ ít nhất một token với xác suất
-    cao hơn gate_threshold trên mọi chuỗi độc hại → không bỏ sót jailbreak.
+    p(y=1|x_{1:t}) = max_{τ≤t} σ(z̃_τ)
 
-    L_total = L_SWiM_BCE + β * L_recall_penalty
-
-    Với L_recall_penalty = Σ_{i: y=1} max(0, θ_1 - max_t σ(z̄_t)):
-    - Nếu probe đã dự đoán ≥ θ_1 tại ít nhất 1 token → penalty = 0
-    - Nếu không → bị phạt tỷ lệ với mức thiếu hụt
+    Uses the cumulative max of probe probabilities as the predictor
+    for the full sequence label. Gradient only flows through the
+    token position with the highest score.
     """
 
-    def __init__(self, temperature: float = 1.0, window_size: int = 16,
-                 recall_penalty_weight: float = 0.5, gate_threshold: float = 0.3):
+    def __init__(self, temperature: float = 1.0, window_size: int = 16):
         super().__init__()
-        self.bce_loss = SoftmaxWeightedBCELoss(temperature, window_size)
-        self.beta = recall_penalty_weight
-        self.theta = gate_threshold
         self.M = window_size
 
     def forward(self, smoothed_logits, labels, attention_mask):
         """
         Args:
             smoothed_logits: (B, T) — z_bar_t after SwIM
-            labels: (B,) — binary labels
+            labels: (B,) — binary or soft labels
             attention_mask: (B, T)
         Returns:
             Scalar loss
         """
-        bce = self.bce_loss(smoothed_logits, labels, attention_mask)
+        content_pos = attention_mask.cumsum(dim=1)
+        valid = (content_pos >= self.M).float() * attention_mask
 
-        # Recall penalty: chỉ áp dụng trên chuỗi độc hại (y=1)
-        harmful_mask = labels.bool()
-        if not harmful_mask.any():
-            return bce
+        has_valid = valid.any(dim=1)
+        if not has_valid.any():
+            return smoothed_logits.sum() * 0.0
+
+        sl = smoothed_logits[has_valid]
+        v = valid[has_valid]
+        y = labels[has_valid]
+
+        # max over logits at valid positions, then sigmoid
+        masked_logits = sl.masked_fill(v == 0, float("-inf"))
+        max_logits = masked_logits.max(dim=1).values  # (B,)
+        max_probs = torch.sigmoid(max_logits)
+
+        loss = F.binary_cross_entropy(max_probs, y, reduction="mean")
+        return loss
+
+
+class AnnealedCumulativeMaxLoss(nn.Module):
+    """Annealed cumulative max loss (Section C.1).
+
+    p(y=1|x_{1:t}) = (1-ω)·σ(z̃_t) + ω·max_{τ≤t} σ(z̃_τ)
+
+    ω starts at 0 and linearly increases to 1 during training.
+    Early training has stable gradients from direct predictions,
+    then transitions to cumulative max for streaming classification.
+    """
+
+    def __init__(self, temperature: float = 1.0, window_size: int = 16,
+                 total_steps: int = 1000):
+        super().__init__()
+        self.tau = temperature
+        self.M = window_size
+        self.total_steps = max(total_steps, 1)
+
+    def forward(self, smoothed_logits, labels, attention_mask, current_step: int):
+        """
+        Args:
+            smoothed_logits: (B, T) — z_bar_t after SwIM
+            labels: (B,) — binary or soft labels
+            attention_mask: (B, T)
+            current_step: current training step for annealing ω
+        Returns:
+            Scalar loss
+        """
+        omega = min(current_step / self.total_steps, 1.0)
 
         content_pos = attention_mask.cumsum(dim=1)
         valid = (content_pos >= self.M).float() * attention_mask
 
-        # Max sigmoid over valid positions for each harmful sample
-        sl_harmful = smoothed_logits[harmful_mask]
-        v_harmful = valid[harmful_mask]
-        masked = sl_harmful.masked_fill(v_harmful == 0, float("-inf"))
-        max_probs = torch.sigmoid(masked.max(dim=1).values)  # (B_harm,)
+        has_valid = valid.any(dim=1)
+        if not has_valid.any():
+            return smoothed_logits.sum() * 0.0
 
-        # penalty = max(0, θ_1 - max_prob) → 0 khi đã đủ tự tin
-        penalty = torch.clamp(self.theta - max_probs, min=0.0).mean()
+        sl = smoothed_logits[has_valid]
+        v = valid[has_valid]
+        y = labels[has_valid]
 
-        return bce + self.beta * penalty
+        # Direct probe probability at each position
+        direct_probs = torch.sigmoid(sl)  # (B, T)
+
+        # Cumulative max probability
+        masked_for_cummax = direct_probs.masked_fill(v == 0, 0.0)
+        cummax_probs, _ = masked_for_cummax.cummax(dim=1)  # (B, T)
+
+        # Interpolated prediction: (1-ω)·direct + ω·cummax
+        interp_probs = (1 - omega) * direct_probs + omega * cummax_probs  # (B, T)
+
+        # Per-token BCE on interpolated predictions
+        bce = F.binary_cross_entropy(
+            interp_probs, y.unsqueeze(1).expand_as(interp_probs), reduction="none"
+        )
+
+        # Softmax weights (same as SoftmaxWeightedBCE) over valid positions
+        scaled = (sl / self.tau).masked_fill(v == 0, float("-inf"))
+        weights = F.softmax(scaled, dim=1)
+
+        return (weights * bce).sum(dim=1).mean()

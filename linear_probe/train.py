@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from probe_config import ProbeConfig
 from model import LinearProbe, SwIMSmoother
-from sw_loss import SoftmaxWeightedBCELoss, GatingLoss
+from sw_loss import SoftmaxWeightedBCELoss, CumulativeMaxLoss, AnnealedCumulativeMaxLoss
 from activation_collector import (
     CachedActivationDataset, cached_collate_fn, precompute_activations,
 )
@@ -116,17 +116,18 @@ def train(config: ProbeConfig):
 
     probe = LinearProbe(hidden_dim).to(device)
     smoother = SwIMSmoother(config.window_size).to(device)
-    if config.gate_mode:
-        # Tầng 1 gating: SWiM BCE + recall penalty → high recall probe
-        criterion = GatingLoss(
-            config.temperature, config.window_size,
-            config.recall_penalty_weight, config.gate_threshold,
+    if config.loss_type == "cummax":
+        criterion = CumulativeMaxLoss(config.temperature, config.window_size)
+        print(f"  Loss: Cumulative Max")
+    elif config.loss_type == "annealed_cummax":
+        total_steps = len(train_loader) * config.num_epochs
+        criterion = AnnealedCumulativeMaxLoss(
+            config.temperature, config.window_size, total_steps,
         )
-        print(f"  Gate mode: recall_penalty_weight={config.recall_penalty_weight}, "
-              f"gate_threshold={config.gate_threshold}")
+        print(f"  Loss: Annealed Cumulative Max (total_steps={total_steps})")
     else:
-        # Detection mode: SWiM BCE chuẩn
         criterion = SoftmaxWeightedBCELoss(config.temperature, config.window_size)
+        print(f"  Loss: Softmax-Weighted BCE")
 
     optimizer = AdamW(probe.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     total_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
@@ -136,8 +137,10 @@ def train(config: ProbeConfig):
     os.makedirs(config.save_dir, exist_ok=True)
     best_f1, patience_cnt = 0.0, 0
     print(f"\nTraining: {config.num_epochs} epochs, M={config.window_size}, "
-          f"tau={config.temperature}, layers={config.layers or 'all'}\n")
+          f"tau={config.temperature}, loss={config.loss_type}, "
+          f"layers={config.layers or 'all'}\n")
 
+    global_step = 0
     for epoch in range(config.num_epochs):
         probe.train()
         total_loss, n = 0.0, 0
@@ -148,7 +151,12 @@ def train(config: ProbeConfig):
             mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            loss = criterion(smoother(probe(acts), mask), labels, mask)
+            smoothed = smoother(probe(acts), mask)
+            if config.loss_type == "annealed_cummax":
+                loss = criterion(smoothed, labels, mask, global_step)
+            else:
+                loss = criterion(smoothed, labels, mask)
+            global_step += 1
             (loss / config.gradient_accumulation_steps).backward()
 
             if (i + 1) % config.gradient_accumulation_steps == 0:
@@ -167,7 +175,7 @@ def train(config: ProbeConfig):
         if (epoch + 1) % config.eval_interval == 0:  # eval_interval from ProbeConfig
             metrics = evaluate_probe(
                 probe, smoother, eval_loader, device,
-                config.window_size, gate_mode=config.gate_mode)
+                config.window_size)
             print(f"  Eval - Acc: {metrics['accuracy']:.4f} | "
                   f"F1: {metrics['f1']:.4f} | Prec: {metrics['precision']:.4f} | "
                   f"Rec: {metrics['recall']:.4f} | AUROC: {metrics['auroc']:.4f}")
@@ -183,9 +191,7 @@ def train(config: ProbeConfig):
                     "window_size": config.window_size,
                     "best_f1": best_f1,
                     "epoch": epoch + 1,
-                    # Gating mode metadata
-                    "gate_mode": config.gate_mode,
-                    "gate_threshold": config.gate_threshold,
+                    "loss_type": config.loss_type,
                 }, os.path.join(config.save_dir, "best_probe.pt"))
                 print(f"  New best F1: {best_f1:.4f}")
             else:
@@ -217,6 +223,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-eval-samples",   type=int,   default=None)
     parser.add_argument("--cache-batch-size",   type=int,   default=None)
     parser.add_argument("--batch-size",         type=int,   default=None)
+    parser.add_argument("--loss-type", type=str, default=None,
+                        choices=["softmax_weighted", "cummax", "annealed_cummax"])
     args = parser.parse_args()
 
     cfg = ProbeConfig.load(args.config) if args.config else ProbeConfig()
@@ -234,5 +242,6 @@ if __name__ == "__main__":
     if args.max_eval_samples:   cfg.max_eval_samples   = args.max_eval_samples
     if args.cache_batch_size:   cfg.cache_batch_size   = args.cache_batch_size
     if args.batch_size:         cfg.batch_size         = args.batch_size
+    if args.loss_type:          cfg.loss_type          = args.loss_type
 
     train(cfg)

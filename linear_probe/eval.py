@@ -20,13 +20,10 @@ def evaluate_probe(
     device: torch.device,
     window_size: int = 16,
     threshold: float = 0.5,
-    gate_mode: bool = False,
 ) -> Dict[str, float]:
     """
     Exchange-level prediction: max smoothed probability over valid positions.
     Flagged as harmful if max probability >= threshold at any point.
-
-    gate_mode=True: dùng threshold thấp hơn, ưu tiên recall cho Tầng 1.
     """
     probe.eval()
     all_probs, all_labels = [], []
@@ -61,7 +58,7 @@ def evaluate_probe(
 
 
 def find_optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
-    """Find threshold maximizing F1 (detection mode)."""
+    """Find threshold maximizing F1."""
     best_f1, best_t = 0.0, 0.5
     for t in np.arange(0.1, 0.95, 0.01):
         f1 = f1_score(labels, (probs >= t).astype(int), zero_division=0)
@@ -70,21 +67,37 @@ def find_optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
     return best_t
 
 
-def find_gate_threshold(
-    probs: np.ndarray, labels: np.ndarray,
-    min_recall: float = 0.95,
-) -> float:
-    """Tìm threshold cao nhất mà vẫn đảm bảo recall >= min_recall (gate mode).
+def ensemble_logits(
+    z1: np.ndarray, z2: np.ndarray, alpha: float = 0.5,
+) -> np.ndarray:
+    """Weighted ensemble of two classifiers' logits.
 
-    Gate mode ưu tiên recall: chọn ngưỡng cao nhất thoả recall >= min_recall.
-    Ngưỡng cao hơn → ít false positive hơn → AlphaSteer được gọi ít hơn.
+    z_ensemble = α * z1 + (1 - α) * z2
+
+    Section 5.2: combining probe with an external classifier
+    improves robustness. Equal weights (α=0.5) are near-optimal.
     """
-    best_t = 0.1
-    for t in np.arange(0.1, 0.90, 0.01):
-        rec = recall_score(labels, (probs >= t).astype(int), zero_division=0)
-        if rec >= min_recall:
-            best_t = t  # giữ ngưỡng cao nhất thỏa mãn
-    return best_t
+    return alpha * z1 + (1 - alpha) * z2
+
+
+def find_optimal_ensemble_alpha(
+    z1: np.ndarray, z2: np.ndarray, labels: np.ndarray,
+    metric: str = "f1",
+) -> float:
+    """Grid-search α minimizing attack success rate (or maximizing F1).
+
+    Returns optimal α in [0, 1].
+    """
+    best_score, best_alpha = -1.0, 0.5
+    for alpha in np.arange(0.0, 1.01, 0.05):
+        z_ens = ensemble_logits(z1, z2, alpha)
+        from scipy.special import expit
+        probs = expit(z_ens)
+        preds = (probs >= 0.5).astype(int)
+        score = f1_score(labels, preds, zero_division=0)
+        if score > best_score:
+            best_score, best_alpha = score, alpha
+    return best_alpha
 
 
 if __name__ == "__main__":
@@ -180,8 +193,7 @@ if __name__ == "__main__":
     # 5. Metrics at fixed threshold
     threshold = args.threshold if args.threshold is not None else cfg.threshold
     metrics = evaluate_probe(probe, smoother, eval_loader, device,
-                             ckpt["window_size"], threshold,
-                             gate_mode=ckpt.get("gate_mode", False))
+                             ckpt["window_size"], threshold)
     print(f"\n=== Eval @ threshold={threshold:.2f} ===")
     print(f"  Accuracy : {metrics['accuracy']:.4f}")
     print(f"  Precision: {metrics['precision']:.4f}")
@@ -197,12 +209,7 @@ if __name__ == "__main__":
     print(f"  Recall   : {recall_score(labels, opt_preds, zero_division=0):.4f}")
     print(f"  F1       : {f1_score(labels, opt_preds, zero_division=0):.4f}")
 
-    # 7. Gate threshold recommendation (gate_mode)
-    if ckpt.get("gate_mode", False):
-        gate_t = find_gate_threshold(probs, labels, min_recall=0.95)
-        gate_preds = (probs >= gate_t).astype(int)
-        print(f"\n=== Gate threshold (recall ≥0.95) = {gate_t:.2f} ===")
-        print(f"  Precision: {precision_score(labels, gate_preds, zero_division=0):.4f}")
-        print(f"  Recall   : {recall_score(labels, gate_preds, zero_division=0):.4f}")
-        print(f"  F1       : {f1_score(labels, gate_preds, zero_division=0):.4f}")
-        print(f"  → Dùng gate_threshold={gate_t:.2f} khi deploy AlphaSteer (Tầng 2)")
+    # 7. Ensemble note
+    print("\n=== Ensemble ===")
+    print("  Use ensemble_logits(z1, z2, alpha=0.5) to combine with external classifier.")
+    print("  Use find_optimal_ensemble_alpha(z1, z2, labels) to optimize alpha.")

@@ -26,7 +26,7 @@ LNAS_DIR="$(dirname "${SLURM_SUBMIT_DIR}")"
 cd "$LNAS_DIR"
 
 TRAIN_DATA="data/train"
-CHECKPOINT="checkpoints/linear_probe_model.pt"
+CHECKPOINT="checkpoints/best_probe.pt"
 MODEL="meta-llama/Llama-3.1-8B-Instruct"
 
 echo "Working dir: $LNAS_DIR"
@@ -36,13 +36,14 @@ echo "Train data : $TRAIN_DATA"
 python linear_probe/train.py \
     --model              "$MODEL" \
     --train-data         "$TRAIN_DATA" \
+    --loss-type          softmax_weighted \
     --epochs             20 \
     --batch-size         32 \
     --cache-batch-size   8 \
     --window-size        16 \
     --temperature        1.0 \
-    --train-ratio        0.20 \
-    --eval-ratio         0.10
+    --train-ratio        0.80 \
+    --eval-ratio         0.20
 
 echo "------End training-------"
 echo "------Starting evaluation--------"

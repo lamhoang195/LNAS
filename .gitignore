@@ -14,6 +14,7 @@ checkpoints/
 # Logs
 logs/
 output/
+act_steering/
 
 *.out
 gpu_status.txt
