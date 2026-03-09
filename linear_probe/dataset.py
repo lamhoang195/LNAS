@@ -7,10 +7,15 @@ from typing import Dict, List, Tuple
 
 
 def _parse_conv(raw: List[Dict]) -> List[Dict]:
-    """Convert [{"user": ...}, {"assistant": ...}, ...] to chat messages."""
+    """Convert [{"user": ...}, {"assistant": ...}, ...] or
+    [{"user": ..., "assistant": ...}, ...] (combined format) to chat messages."""
     messages = []
     for turn in raw:
-        if "user" in turn:
+        if "user" in turn and "assistant" in turn:
+            # Combined format: both roles in the same dict
+            messages.append({"role": "user", "content": turn["user"]})
+            messages.append({"role": "assistant", "content": turn["assistant"]})
+        elif "user" in turn:
             messages.append({"role": "user", "content": turn["user"]})
         elif "assistant" in turn:
             messages.append({"role": "assistant", "content": turn["assistant"]})

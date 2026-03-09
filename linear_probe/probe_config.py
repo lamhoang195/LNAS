@@ -11,13 +11,11 @@ class ProbeConfig:
     device: str = "cuda"
 
     # Probe: trống là probe trên tất cả các layer, nếu có thì chỉ probe trên các layer được chỉ định
-    layers: List[int] = field(default_factory=list)
+    layers: List[int] = field(default_factory=lambda: list(range(15, 33)))
 
     # Data
     train_file: str = "data/train/"
-    eval_file: str = ""  # empty → auto split per file from train_file
-    train_ratio: float = 0.80   # fraction of each file used for training
-    eval_ratio:  float = 0.20   # fraction of each file used for evaluation
+    eval_file: str = "data/test/linear_probe_test/"  # dùng test set làm validation để chọn model
     max_train_samples: int = -1  # -1 = no cap
     max_eval_samples:  int = -1  # -1 = no cap
     cache_batch_size:  int = 8   # batch size for activation caching (LLM forward pass)

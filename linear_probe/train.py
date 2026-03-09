@@ -62,17 +62,8 @@ def train(config: ProbeConfig):
 
     # 2. Load data
     print("Loading data...")
-    if config.eval_file and os.path.exists(config.eval_file) and os.listdir(config.eval_file):
-        train_data = load_data(config.train_file)
-        eval_data = load_data(config.eval_file)
-    else:
-        # Per-file split from train directory
-        train_data, eval_data = load_data_split(
-            config.train_file,
-            train_ratio=config.train_ratio,
-            eval_ratio=config.eval_ratio,
-            seed=config.seed,
-        )
+    train_data = load_data(config.train_file)
+    eval_data  = load_data(config.eval_file)
     print(f"  Train: {len(train_data)} | Eval: {len(eval_data)}")
 
     # Cap sample counts if requested

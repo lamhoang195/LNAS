@@ -148,12 +148,7 @@ if __name__ == "__main__":
         print("Building eval activation cache...")
         from train import load_base_model
         model, tokenizer = load_base_model(cfg)
-
-        if cfg.eval_file and os.path.exists(cfg.eval_file) and os.listdir(cfg.eval_file):
-            eval_data = load_data(cfg.eval_file)
-        else:
-            _, eval_data = load_data_split(cfg.train_file, eval_ratio=0.20, seed=cfg.seed)
-
+        eval_data = load_data(cfg.eval_file)
         precompute_activations(
             model, tokenizer, eval_data, target_layers,
             eval_cache, cfg.max_sequence_length, multi_layer,
