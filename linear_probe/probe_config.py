@@ -7,7 +7,7 @@ class ProbeConfig:
     # Model
     model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
     dtype: str = "bfloat16"
-    max_sequence_length: int = 16384
+    max_sequence_length: int = 8192
     device: str = "cuda"
 
     # Probe: trống là probe trên tất cả các layer, nếu có thì chỉ probe trên các layer được chỉ định

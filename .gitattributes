@@ -1,1 +1,1 @@
-data/train.json filter=lfs diff=lfs merge=lfs -text
+data/train/*.jsonl filter=lfs diff=lfs merge=lfs -text
