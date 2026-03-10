@@ -1,5 +1,7 @@
 """Training pipeline for the Linear Probe classifier."""
 
+import contextlib
+import gc
 import os
 import time
 import random
@@ -12,13 +14,17 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# Bật TF32 để tăng tốc matmul trên Ampere+ GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from probe_config import ProbeConfig
 from model import LinearProbe, SwIMSmoother
 from sw_loss import SoftmaxWeightedBCELoss, CumulativeMaxLoss, AnnealedCumulativeMaxLoss
 from activation_collector import (
     CachedActivationDataset, cached_collate_fn, precompute_activations,
 )
-from dataset import load_data, load_data_split
+from dataset import load_data
 from eval import evaluate_probe
 
 
@@ -42,13 +48,24 @@ def load_base_model(config: ProbeConfig):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=dtype.get(config.dtype, torch.bfloat16),
-        device_map="auto",
-        trust_remote_code=True,
-        attn_implementation="sdpa",
-    )
+    # Thử flash_attention_2 trước (A100/H100), fallback sang sdpa nếu không hỗ trợ
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=dtype.get(config.dtype, torch.bfloat16),
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation=config.attn_impl,
+        )
+    except (ValueError, ImportError):
+        print(f"  attn_impl='{config.attn_impl}' không khả dụng, fallback sang sdpa")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=dtype.get(config.dtype, torch.bfloat16),
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="sdpa",
+        )
     model.eval()
     return model, tokenizer
 
@@ -65,16 +82,6 @@ def train(config: ProbeConfig):
     train_data = load_data(config.train_file)
     eval_data  = load_data(config.eval_file)
     print(f"  Train: {len(train_data)} | Eval: {len(eval_data)}")
-
-    # Cap sample counts if requested
-    if config.max_train_samples > 0:
-        random.shuffle(train_data)
-        train_data = train_data[:config.max_train_samples]
-    if config.max_eval_samples > 0:
-        random.shuffle(eval_data)
-        eval_data = eval_data[:config.max_eval_samples]
-    if config.max_train_samples > 0 or config.max_eval_samples > 0:
-        print(f"  After cap → Train: {len(train_data)} | Eval: {len(eval_data)}")
     multi_layer = len(config.layers) != 1
     train_cache = os.path.join(config.cache_root, "train")
     eval_cache = os.path.join(config.cache_root, "eval")
@@ -89,16 +96,25 @@ def train(config: ProbeConfig):
         )
 
     del model
+    gc.collect()
     torch.cuda.empty_cache()
 
     # 4. Dataloaders
+    _nw = max(config.num_workers, 0)
+    _loader_kwargs = dict(
+        collate_fn=cached_collate_fn,
+        num_workers=_nw,
+        pin_memory=True,
+        persistent_workers=(_nw > 0),
+        prefetch_factor=(4 if _nw > 0 else None),
+    )
     train_loader = DataLoader(
         CachedActivationDataset(train_cache), batch_size=config.batch_size,
-        shuffle=True, collate_fn=cached_collate_fn, num_workers=8, pin_memory=True,
+        shuffle=True, **_loader_kwargs,
     )
     eval_loader = DataLoader(
         CachedActivationDataset(eval_cache), batch_size=config.batch_size,
-        shuffle=False, collate_fn=cached_collate_fn, num_workers=8, pin_memory=True,
+        shuffle=False, **_loader_kwargs,
     )
 
     # 5. Probe + optimizer
@@ -107,6 +123,23 @@ def train(config: ProbeConfig):
 
     probe = LinearProbe(hidden_dim).to(device)
     smoother = SwIMSmoother(config.window_size).to(device)
+
+    optimizer = AdamW(probe.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    total_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(total_steps, 1))
+
+    # Compile sau khi tạo optimizer để parameters vẫn được track đúng
+    if config.use_compile and hasattr(torch, "compile"):
+        probe = torch.compile(probe)
+        smoother = torch.compile(smoother, dynamic=True)
+        print("  torch.compile enabled")
+
+    # AMP GradScaler
+    use_amp = config.use_amp and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else contextlib.nullcontext()
+    print(f"  AMP: {use_amp}")
+
     if config.loss_type == "cummax":
         criterion = CumulativeMaxLoss(config.temperature, config.window_size)
         print(f"  Loss: Cumulative Max")
@@ -119,10 +152,6 @@ def train(config: ProbeConfig):
     else:
         criterion = SoftmaxWeightedBCELoss(config.temperature, config.window_size)
         print(f"  Loss: Softmax-Weighted BCE")
-
-    optimizer = AdamW(probe.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    total_steps = len(train_loader) * config.num_epochs // config.gradient_accumulation_steps
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
 
     # 6. Training loop
     os.makedirs(config.save_dir, exist_ok=True)
@@ -138,26 +167,51 @@ def train(config: ProbeConfig):
         t0 = time.time()
 
         for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
-            acts = batch["activations"].to(device)
-            mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            acts   = batch["activations"].to(device, non_blocking=True)
+            mask   = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-            smoothed = smoother(probe(acts), mask)
-            if config.loss_type == "annealed_cummax":
-                loss = criterion(smoothed, labels, mask, global_step)
-            else:
-                loss = criterion(smoothed, labels, mask)
+            with amp_ctx:
+                smoothed = smoother(probe(acts), mask)
+                if config.loss_type == "annealed_cummax":
+                    loss = criterion(smoothed, labels, mask, global_step)
+                else:
+                    loss = criterion(smoothed, labels, mask)
             global_step += 1
-            (loss / config.gradient_accumulation_steps).backward()
+
+            scaled = loss / config.gradient_accumulation_steps
+            if scaler is not None:
+                scaler.scale(scaled).backward()
+            else:
+                scaled.backward()
 
             if (i + 1) % config.gradient_accumulation_steps == 0:
-                nn.utils.clip_grad_norm_(probe.parameters(), config.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(probe.parameters(), config.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(probe.parameters(), config.max_grad_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
             total_loss += loss.item()
             n += 1
+
+        # Flush remaining accumulated gradients at end of epoch
+        if len(train_loader) % config.gradient_accumulation_steps != 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(probe.parameters(), config.max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(probe.parameters(), config.max_grad_norm)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
         print(f"Epoch {epoch+1}/{config.num_epochs} - "
               f"Loss: {total_loss/max(n,1):.4f} - {time.time()-t0:.1f}s")
@@ -208,10 +262,6 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--train-data", type=str, default=None)
     parser.add_argument("--eval-data", type=str, default=None)
-    parser.add_argument("--train-ratio", type=float, default=None)
-    parser.add_argument("--eval-ratio",  type=float, default=None)
-    parser.add_argument("--max-train-samples",  type=int,   default=None)
-    parser.add_argument("--max-eval-samples",   type=int,   default=None)
     parser.add_argument("--cache-batch-size",   type=int,   default=None)
     parser.add_argument("--batch-size",         type=int,   default=None)
     parser.add_argument("--loss-type", type=str, default=None,
@@ -227,10 +277,6 @@ if __name__ == "__main__":
     if args.temperature: cfg.temperature = args.temperature
     if args.train_data:  cfg.train_file   = args.train_data
     if args.eval_data:   cfg.eval_file    = args.eval_data
-    if args.train_ratio:        cfg.train_ratio        = args.train_ratio
-    if args.eval_ratio:         cfg.eval_ratio         = args.eval_ratio
-    if args.max_train_samples:  cfg.max_train_samples  = args.max_train_samples
-    if args.max_eval_samples:   cfg.max_eval_samples   = args.max_eval_samples
     if args.cache_batch_size:   cfg.cache_batch_size   = args.cache_batch_size
     if args.batch_size:         cfg.batch_size         = args.batch_size
     if args.loss_type:          cfg.loss_type          = args.loss_type

@@ -9,16 +9,17 @@ class ProbeConfig:
     dtype: str = "bfloat16"
     max_sequence_length: int = 8192
     device: str = "cuda"
+    # attn_implementation: "flash_attention_2" (A100/H100), "sdpa" (fallback)
+    attn_impl: str = "flash_attention_2"
 
-    # Probe: trống là probe trên tất cả các layer, nếu có thì chỉ probe trên các layer được chỉ định
-    layers: List[int] = field(default_factory=lambda: list(range(15, 33)))
+    # Probe: [] = tất cả transformer layers (full-layer cache), hoặc chỉ định subset
+    layers: List[int] = field(default_factory=list)
 
     # Data
     train_file: str = "data/train/"
     eval_file: str = "data/test/linear_probe_test/"  # dùng test set làm validation để chọn model
-    max_train_samples: int = -1  # -1 = no cap
-    max_eval_samples:  int = -1  # -1 = no cap
-    cache_batch_size:  int = 8   # batch size for activation caching (LLM forward pass)
+    # batch size for activation caching (LLM forward pass) — A100 80GB: ~32
+    cache_batch_size:  int = 32
     cache_root: str = "activation_cache"
     
     # Training hyperparameters
@@ -27,12 +28,18 @@ class ProbeConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0 # Regularization L2 → chống overfitting
     num_epochs: int = 20
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4 # Để effective batch size = batch_size * gradient_accumulation_steps
+    # probe rất nhỏ (linear), A100 80GB: batch 32-64 (probe training không cần LLM)
+    batch_size: int = 32
+    gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0 # Gradient clipping để ổn định training → tránh exploding gradients
     seed: int = 42
     save_dir: str = "checkpoints"
     early_stop_patience: int = 5
+    num_workers: int = 4  # DataLoader workers for cached activation loading
+
+    # GPU optimization
+    use_amp: bool = True      # Automatic Mixed Precision (bfloat16 forward/backward)
+    use_compile: bool = True  # torch.compile probe + smoother
 
     # Eval
     eval_interval: int = 1  # run eval every N epochs

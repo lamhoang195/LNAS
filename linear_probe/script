@@ -13,6 +13,8 @@ module load shared conda
 conda activate linear
 module load shared
 
+pip install flash-attn --no-build-isolation
+
 export CUDA_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -35,6 +37,9 @@ echo "Model      : $MODEL"
 echo "Train data : $TRAIN_DATA"
 echo "Eval data  : $EVAL_DATA"
 
+# A100 80GB: cache full layer (--layers không truyền = dùng [] trong config = all layers)
+# cache-batch-size=32: tối ưu VRAM khi chạy LLM forward pass
+# batch-size=32: probe nhỏ, A100 80GB dư VRAM sau khi xóa LLM
 python linear_probe/train.py \
     --model              "$MODEL" \
     --train-data         "$TRAIN_DATA" \
@@ -42,7 +47,7 @@ python linear_probe/train.py \
     --loss-type          softmax_weighted \
     --epochs             20 \
     --batch-size         32 \
-    --cache-batch-size   8 \
+    --cache-batch-size   32 \
     --window-size        16 \
     --temperature        1.0
 

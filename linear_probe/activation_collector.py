@@ -1,7 +1,7 @@
 """Activation extraction and caching for probe training."""
 
 import os
-from typing import Dict, List, Optional
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -143,9 +143,14 @@ def precompute_activations(
         features = collector.collect(enc["input_ids"], enc["attention_mask"], multi_layer)
 
         for i, (idx, item) in enumerate(chunk):
+            # Strip padding: chỉ lưu các token thực (không lưu padding)
+            # Tiết kiệm disk ~N_pad/N_total và giảm bộ nhớ khi load
+            mask_i = enc["attention_mask"][i].bool()  # (T,)
+            real_acts = features[i][mask_i]            # (seq_len, D)
+            real_mask = torch.ones(mask_i.sum(), dtype=torch.long)
             cache.save(
-                activations=features[i],
-                attention_mask=enc["attention_mask"][i],
+                activations=real_acts,
+                attention_mask=real_mask,
                 label=torch.tensor(item["label"], dtype=torch.float32),
                 idx=idx,
             )
