@@ -1,158 +1,110 @@
-"""Activation extraction and caching for probe training."""
-
-import os
-from typing import List
-
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
-from tqdm import tqdm
-
+from typing import List, Dict, Any
 
 class ActivationCollector:
-    """Extract hidden-state activations from specified (or all) layers."""
-
     def __init__(self, model: nn.Module, target_layers: List[int] = None, device=None):
         self.model = model
         self.target_layers = target_layers or []
         self.device = device or next(model.parameters()).device
 
     def _resolve_layers(self, n_hidden_states: int) -> List[int]:
-        """Empty target_layers = all transformer layers (skip embedding at [0])."""
         if self.target_layers:
             return self.target_layers
         return list(range(1, n_hidden_states))
 
     @torch.no_grad()
     def collect(self, input_ids, attention_mask, multi_layer=True) -> torch.Tensor:
-        """
-        Forward pass -> extract & build feature vector psi_t.
-
-        Multi-layer: psi_t = [phi_t^(l1); phi_t^(l2); ...]  (concatenated)
-        Single-layer: psi_t = phi_t^(l)
-
-        Returns: (B, T, D)
-        """
         out = self.model(
-            input_ids=input_ids.to(self.model.device),
-            attention_mask=attention_mask.to(self.model.device),
-            output_hidden_states=True, return_dict=True,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
         )
+
         layers = self._resolve_layers(len(out.hidden_states))
+        hidden_states = out.hidden_states
 
         if multi_layer and len(layers) > 1:
-            return torch.cat([out.hidden_states[l].detach() for l in layers], dim=-1)
-        return out.hidden_states[layers[0]].detach()
+            acts = torch.cat([hidden_states[l].detach() for l in layers], dim=-1)
+        else:
+            acts = hidden_states[layers[0]].detach()
 
+        del hidden_states
+        del out
 
-class ActivationCache:
-    """Save/load pre-computed activations to disk."""
+        return acts
 
-    def __init__(self, cache_dir: str):
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
+def make_tokenized_collate_fn(tokenizer, max_length):
+    def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
+        texts = []
+        labels = []
+        for item in batch:
+            messages = []
+            for turn in item["conversations"]:
+                if "user" in turn:
+                    messages.append({"role": "user", "content": turn["user"]})
+                elif "assistant" in turn:
+                    messages.append({"role": "assistant", "content": turn["assistant"]})
+            
+            try:
+                seq = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            except Exception:
+                seq = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+            
+            texts.append(seq)
+            labels.append(item["label"])
 
-    def save(self, activations, attention_mask, label, idx):
-        torch.save({
-            "activations": activations.cpu().half(),
-            "attention_mask": attention_mask.cpu(),
-            "label": label.cpu(),
-        }, os.path.join(self.cache_dir, f"sample_{idx}.pt"))
+        encoded = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt"
+        )
+        
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "labels": torch.tensor(labels, dtype=torch.float32)  # shape (B,)
+        }
+    return collate_fn
 
-    def exists(self, idx):
-        return os.path.exists(os.path.join(self.cache_dir, f"sample_{idx}.pt"))
+class OnTheFlyLoader:
+    def __init__(self, dataloader, collector: ActivationCollector, multi_layer: bool = True, return_cpu: bool = False):
+        self.dataloader = dataloader
+        self.collector = collector
+        self.multi_layer = multi_layer
+        self.return_cpu = return_cpu
 
-    def count(self):
-        return len([f for f in os.listdir(self.cache_dir) if f.endswith(".pt")])
+    def __iter__(self):
+        for batch in self.dataloader:
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
 
+            # Lên device cho input ở chung 1 chỗ
+            device = next(self.collector.model.parameters()).device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
 
-class CachedActivationDataset(Dataset):
-    """Load pre-cached activations from disk."""
+            activations = self.collector.collect(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                multi_layer=self.multi_layer
+            )
+            
+            if self.return_cpu:
+                activations = activations.cpu()
+                attention_mask = attention_mask.cpu()
+                labels = labels.cpu()
 
-    def __init__(self, cache_dir: str):
-        files = sorted(f for f in os.listdir(cache_dir) if f.endswith(".pt"))
-        self.paths = [os.path.join(cache_dir, f) for f in files]
+            yield {
+                "activations": activations,
+                "attention_mask": attention_mask,
+                "labels": labels
+            }
 
     def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        data = torch.load(self.paths[idx], map_location="cpu", weights_only=True)
-        return {
-            "activations": data["activations"].float(),
-            "attention_mask": data["attention_mask"],
-            "label": data["label"],
-        }
-
-
-def cached_collate_fn(batch):
-    """Left-pad cached activations."""
-    max_len = max(b["activations"].size(0) for b in batch)
-    acts, masks, labels = [], [], []
-    for b in batch:
-        pad = max_len - b["activations"].size(0)
-        d = b["activations"].size(-1)
-        acts.append(torch.cat([torch.zeros(pad, d), b["activations"]], dim=0))
-        masks.append(torch.cat([torch.zeros(pad, dtype=b["attention_mask"].dtype),
-                                b["attention_mask"]]))
-        labels.append(b["label"])
-    return {
-        "activations": torch.stack(acts),
-        "attention_mask": torch.stack(masks),
-        "labels": torch.stack(labels),
-    }
-
-
-def _item_to_text(tokenizer, item) -> str:
-    """Convert a data item to a single string using the tokenizer's chat template."""
-    messages = item["messages"]
-    has_response = messages and messages[-1]["role"] == "assistant"
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False,
-            add_generation_prompt=not has_response,
-        )
-    return " ".join(m["content"] for m in messages)
-
-
-@torch.no_grad()
-def precompute_activations(
-    model, tokenizer, data, target_layers,
-    cache_dir, max_length=2048, multi_layer=True, batch_size=8,
-):
-    """Pre-compute and cache activations for the dataset (batched)."""
-    collector = ActivationCollector(model, target_layers)
-    cache = ActivationCache(cache_dir)
-
-    # Only process samples that are not yet cached
-    pending = [(idx, item) for idx, item in enumerate(data) if not cache.exists(idx)]
-    if not pending:
-        print(f"All {cache.count()} samples already cached in {cache_dir}")
-        return
-
-    n_batches = (len(pending) + batch_size - 1) // batch_size
-    for b in tqdm(range(n_batches), desc="Caching activations"):
-        chunk = pending[b * batch_size:(b + 1) * batch_size]
-        texts = [_item_to_text(tokenizer, item) for _, item in chunk]
-
-        enc = tokenizer(
-            texts, return_tensors="pt", max_length=max_length,
-            truncation=True, padding=True,
-        )
-        # features: (B, T, D)
-        features = collector.collect(enc["input_ids"], enc["attention_mask"], multi_layer)
-
-        for i, (idx, item) in enumerate(chunk):
-            # Strip padding: chỉ lưu các token thực (không lưu padding)
-            # Tiết kiệm disk ~N_pad/N_total và giảm bộ nhớ khi load
-            mask_i = enc["attention_mask"][i].bool()  # (T,)
-            real_acts = features[i][mask_i]            # (seq_len, D)
-            real_mask = torch.ones(mask_i.sum(), dtype=torch.long)
-            cache.save(
-                activations=real_acts,
-                attention_mask=real_mask,
-                label=torch.tensor(item["label"], dtype=torch.float32),
-                idx=idx,
-            )
-
-    print(f"Cached {cache.count()} samples to {cache_dir}")
+        return len(self.dataloader)

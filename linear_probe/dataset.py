@@ -1,99 +1,54 @@
-"""Data loading for conversation datasets with binary labels."""
-
 import json
 import os
-import random
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 def _parse_conv(raw: List[Dict]) -> List[Dict]:
-    """Convert [{"user": ...}, {"assistant": ...}, ...] or
-    [{"user": ..., "assistant": ...}, ...] (combined format) to chat messages."""
-    messages = []
+    conversations = []
     for turn in raw:
         if "user" in turn and "assistant" in turn:
-            # Combined format: both roles in the same dict
-            messages.append({"role": "user", "content": turn["user"]})
-            messages.append({"role": "assistant", "content": turn["assistant"]})
+            conversations.append({"user": turn["user"]})
+            conversations.append({"assistant": turn["assistant"]})
+        elif "role" in turn and "content" in turn:
+            # Handle messages style: {"role": "user", "content": "..."}
+            if turn["role"] == "user":
+                conversations.append({"user": turn["content"]})
+            elif turn["role"] == "assistant":
+                conversations.append({"assistant": turn["content"]})
         elif "user" in turn:
-            messages.append({"role": "user", "content": turn["user"]})
+            conversations.append({"user": turn["user"]})
         elif "assistant" in turn:
-            messages.append({"role": "assistant", "content": turn["assistant"]})
-    return messages
+            conversations.append({"assistant": turn["assistant"]})
+    return conversations
 
 
-def load_data(data_dir: str) -> List[Dict]:
-    """Load all .jsonl files from directory.
-
-    Each line must have:
-      - ``label``: int (1 = harmful, 0 = benign)
-      - ``conversation``  (single-key list of user/assistant dicts), OR
-      - ``conversations`` (multi-turn version of the same)
-    Returns a list of dicts: {"messages": [...], "label": int}
-    """
+def load_data(data_path: str) -> List[Dict]:
     dataset = []
-    for fname in sorted(os.listdir(data_dir)):
-        if not fname.endswith(".jsonl"):
-            continue
-        path = os.path.join(data_dir, fname)
+    
+    # Identify if it's a file or directory
+    if os.path.isfile(data_path):
+        files_to_read = [data_path]
+    elif os.path.isdir(data_path):
+        files_to_read = [os.path.join(data_path, f) for f in sorted(os.listdir(data_path)) if f.endswith(".jsonl")]
+    else:
+        raise ValueError(f"Path {data_path} is neither a file nor a directory.")
+
+    for path in files_to_read:
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 item = json.loads(line)
-                label = int(item["label"])
+                label = float(item["label"])
                 raw = item.get("conversation") or item.get("conversations") or []
-                messages = _parse_conv(raw)
-                if messages:
-                    dataset.append({"messages": messages, "label": label})
+                conversations = _parse_conv(raw)
+                if conversations:
+                    sample_id = str(item.get("id"))
+                    sample = {
+                        "id": sample_id,
+                        "label": label,
+                        "conversations": conversations,
+                    }
+                    dataset.append(sample)
     return dataset
-
-
-def load_data_split(
-    data_dir: str,
-    train_ratio: float = 0.80,
-    eval_ratio: float = 0.20,
-    seed: int = 42,
-) -> Tuple[List, List]:
-    """Load all .jsonl files and split **per-file** into train/eval.
-
-    Each file contributes train_ratio*100% to train and eval_ratio*100%
-    to eval (the remaining fraction is discarded), so every file is
-    represented in both sets.
-    Returns (train_data, eval_data).
-    """
-    rng = random.Random(seed)
-    train_all, eval_all = [], []
-
-    for fname in sorted(os.listdir(data_dir)):
-        if not fname.endswith(".jsonl"):
-            continue
-        path = os.path.join(data_dir, fname)
-        file_items = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                item = json.loads(line)
-                label = int(item["label"])
-                raw = item.get("conversation") or item.get("conversations") or []
-                messages = _parse_conv(raw)
-                if messages:
-                    file_items.append({"messages": messages, "label": label})
-
-        if not file_items:
-            continue
-
-        rng.shuffle(file_items)
-        n_eval  = max(1, int(len(file_items) * eval_ratio))
-        n_train = int(len(file_items) * train_ratio)
-        eval_all.extend(file_items[:n_eval])
-        train_all.extend(file_items[n_eval:n_eval + n_train])
-
-        print(f"  {fname}: {n_train} train / {n_eval} eval (of {len(file_items)} total)")
-
-    rng.shuffle(train_all)
-    rng.shuffle(eval_all)
-    return train_all, eval_all

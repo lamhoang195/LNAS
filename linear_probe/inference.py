@@ -12,6 +12,15 @@ from activation_collector import ActivationCollector
 from probe_config import ProbeConfig
 
 
+def _strip_orig_mod_prefix(state_dict):
+    if not any(k.startswith("_orig_mod.") for k in state_dict):
+        return state_dict
+    return {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state_dict.items()
+    }
+
+
 class StreamingDetector:
     """Real-time streaming detector using EMA smoothing.
 
@@ -99,12 +108,15 @@ def load_detector(config: ProbeConfig, checkpoint_path=None):
         map_location="cpu", weights_only=True,
     )
     probe = LinearProbe(ckpt["hidden_dim"])
-    probe.load_state_dict(ckpt["probe_state_dict"])
+    probe.load_state_dict(_strip_orig_mod_prefix(ckpt["probe_state_dict"]))
 
     model, tokenizer = load_base_model(config)
+    probe = probe.to(model.device)
     return StreamingDetector(
         probe, model, tokenizer, ckpt["target_layers"],
-        config.ema_alpha, config.threshold, ckpt.get("multi_layer", True),
+        ckpt.get("ema_alpha", config.ema_alpha),
+        config.threshold,
+        ckpt.get("multi_layer", True),
     )
 
 

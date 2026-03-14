@@ -12,15 +12,12 @@ class ProbeConfig:
     # attn_implementation: "flash_attention_2" (A100/H100), "sdpa" (fallback)
     attn_impl: str = "flash_attention_2"
 
-    # Probe: [] = tất cả transformer layers (full-layer cache), hoặc chỉ định subset
+    # Probe: [] = tất cả transformer layers, hoặc chỉ định subset
     layers: List[int] = field(default_factory=list)
 
     # Data
     train_file: str = "data/train/"
     eval_file: str = "data/test/linear_probe_test/"  # dùng test set làm validation để chọn model
-    # batch size for activation caching (LLM forward pass) — A100 80GB: ~32
-    cache_batch_size:  int = 32
-    cache_root: str = "activation_cache"
     
     # Training hyperparameters
     window_size: int = 16 # M for SWiM smoothing
@@ -28,14 +25,14 @@ class ProbeConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0 # Regularization L2 → chống overfitting
     num_epochs: int = 20
-    # probe rất nhỏ (linear), A100 80GB: batch 32-64 (probe training không cần LLM)
-    batch_size: int = 32
+    # On-the-fly mode: đây là batch size cho cả LLM activation + probe.
+    batch_size: int = 8
     gradient_accumulation_steps: int = 1
     max_grad_norm: float = 1.0 # Gradient clipping để ổn định training → tránh exploding gradients
     seed: int = 42
     save_dir: str = "checkpoints"
     early_stop_patience: int = 5
-    num_workers: int = 4  # DataLoader workers for cached activation loading
+    num_workers: int = 2  # DataLoader workers cho tokenization on-the-fly
 
     # GPU optimization
     use_amp: bool = True      # Automatic Mixed Precision (bfloat16 forward/backward)
@@ -50,7 +47,7 @@ class ProbeConfig:
     # Inference
     ema_alpha: float = 0.1
     threshold: float = 0.5
-    checkpoint_path: str = "checkpoints/linear_probe_model.pt"
+    checkpoint_path: str = "checkpoints/best_probe.pt"
 
     log_dir: str = "logs"
 

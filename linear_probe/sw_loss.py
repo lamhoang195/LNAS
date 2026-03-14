@@ -18,27 +18,30 @@ class SoftmaxWeightedBCELoss(nn.Module):
         Returns:
             Scalar loss
         """
-        # Valid positions: at least M content tokens seen (full window)
-        content_pos = attention_mask.cumsum(dim=1)
-        valid = (content_pos >= self.M).float() * attention_mask
+        am_bool = attention_mask.bool()  # cast once to avoid repeated alloc
+        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
+        
+        # Ensure sequences smaller than M are not ignored by evaluating their last valid token
+        seq_lens = attention_mask.sum(dim=1, keepdim=True)
+        valid_threshold = torch.clamp(seq_lens, max=self.M)
+        
+        valid = (content_pos >= valid_threshold) & am_bool
 
-        # Skip samples with T_i < M (no valid positions)
         has_valid = valid.any(dim=1)
         if not has_valid.any():
             return smoothed_logits.sum() * 0.0
 
-        sl = smoothed_logits[has_valid]
+        sl = smoothed_logits[has_valid]  # new tensor (boolean indexing = copy)
         v = valid[has_valid]
         y = labels[has_valid]
+        not_v = ~v  # cache: used twice below
 
-        # Per-token BCE
-        probs = torch.sigmoid(sl)
-        bce = F.binary_cross_entropy(
-            probs, y.unsqueeze(1).expand_as(probs), reduction="none"
-        )
+        bce = F.binary_cross_entropy_with_logits(
+            sl, y.unsqueeze(1).expand_as(sl), reduction="none"
+        ).masked_fill_(not_v, 0.0)  # in-place: output of bce_with_logits is a fresh tensor
 
-        # Softmax weights over valid positions only
-        scaled = (sl / self.tau).masked_fill(v == 0, float("-inf"))
+        # divide before mask → 1 tensor allocation instead of 2
+        scaled = (sl / self.tau).masked_fill_(not_v, float("-inf"))
         weights = F.softmax(scaled, dim=1)
 
         return (weights * bce).sum(dim=1).mean()
@@ -54,7 +57,7 @@ class CumulativeMaxLoss(nn.Module):
     token position with the highest score.
     """
 
-    def __init__(self, temperature: float = 1.0, window_size: int = 16):
+    def __init__(self, window_size: int = 16):
         super().__init__()
         self.M = window_size
 
@@ -67,8 +70,12 @@ class CumulativeMaxLoss(nn.Module):
         Returns:
             Scalar loss
         """
-        content_pos = attention_mask.cumsum(dim=1)
-        valid = (content_pos >= self.M).float() * attention_mask
+        am_bool = attention_mask.bool()
+        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
+        
+        seq_lens = attention_mask.sum(dim=1, keepdim=True)
+        valid_threshold = torch.clamp(seq_lens, max=self.M)
+        valid = (content_pos >= valid_threshold) & am_bool
 
         has_valid = valid.any(dim=1)
         if not has_valid.any():
@@ -78,13 +85,11 @@ class CumulativeMaxLoss(nn.Module):
         v = valid[has_valid]
         y = labels[has_valid]
 
-        # max over logits at valid positions, then sigmoid
-        masked_logits = sl.masked_fill(v == 0, float("-inf"))
-        max_logits = masked_logits.max(dim=1).values  # (B,)
-        max_probs = torch.sigmoid(max_logits)
+        # sigmoid output is saved for its own backward, so masked_fill must be out-of-place
+        # clamp to avoid log(0) = -inf when sigmoid saturates to exactly 1.0 in float32
+        max_prob = torch.sigmoid(sl).masked_fill(~v, 0.0).max(dim=1).values.clamp(1e-7, 1 - 1e-7)
 
-        loss = F.binary_cross_entropy(max_probs, y, reduction="mean")
-        return loss
+        return F.binary_cross_entropy(max_prob, y, reduction="mean")
 
 
 class AnnealedCumulativeMaxLoss(nn.Module):
@@ -116,34 +121,35 @@ class AnnealedCumulativeMaxLoss(nn.Module):
         """
         omega = min(current_step / self.total_steps, 1.0)
 
-        content_pos = attention_mask.cumsum(dim=1)
-        valid = (content_pos >= self.M).float() * attention_mask
+        am_bool = attention_mask.bool()
+        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
+        
+        seq_lens = attention_mask.sum(dim=1, keepdim=True)
+        valid_threshold = torch.clamp(seq_lens, max=self.M)
+        valid = (content_pos >= valid_threshold) & am_bool
 
         has_valid = valid.any(dim=1)
         if not has_valid.any():
             return smoothed_logits.sum() * 0.0
 
-        sl = smoothed_logits[has_valid]
+        sl = smoothed_logits[has_valid]  # new tensor (boolean indexing = copy)
         v = valid[has_valid]
         y = labels[has_valid]
+        not_v = ~v  # cache: used twice below
 
-        # Direct probe probability at each position
         direct_probs = torch.sigmoid(sl)  # (B, T)
 
-        # Cumulative max probability
-        masked_for_cummax = direct_probs.masked_fill(v == 0, 0.0)
-        cummax_probs, _ = masked_for_cummax.cummax(dim=1)  # (B, T)
+        # sigmoid output saved for backward → masked_fill must be out-of-place
+        cummax_probs = direct_probs.masked_fill(not_v, 0.0).cummax(dim=1).values  # (B, T)
 
-        # Interpolated prediction: (1-ω)·direct + ω·cummax
-        interp_probs = (1 - omega) * direct_probs + omega * cummax_probs  # (B, T)
+        interp_probs = torch.lerp(direct_probs, cummax_probs, omega).clamp_(1e-7, 1 - 1e-7)  # (B, T)
 
-        # Per-token BCE on interpolated predictions
         bce = F.binary_cross_entropy(
-            interp_probs, y.unsqueeze(1).expand_as(interp_probs), reduction="none"
-        )
+            interp_probs,
+            y.unsqueeze(1).expand_as(interp_probs),
+            reduction="none"
+        ).masked_fill_(not_v, 0.0)  # in-place: bce output is a fresh tensor
 
-        # Softmax weights (same as SoftmaxWeightedBCE) over valid positions
-        scaled = (sl / self.tau).masked_fill(v == 0, float("-inf"))
-        weights = F.softmax(scaled, dim=1)
-
-        return (weights * bce).sum(dim=1).mean()
+        # normalize by valid token count to avoid penalizing long sequences more
+        valid_counts = v.sum(dim=1).clamp(min=1)
+        return (bce.sum(dim=1) / valid_counts).mean()
