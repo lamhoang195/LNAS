@@ -62,6 +62,14 @@ def load_base_model(config: ProbeConfig):
 
 
 def train(config: ProbeConfig):
+    """
+    Train linear probe with on-the-fly activation computation (instruction E).
+
+    Pipeline:
+      dataset (JSONL) → DataLoader (tokenize only) → OnTheFlyLoader
+        → per batch: LLM forward → collect hidden states → train probe
+      No precomputed activations; activations are computed inside the training loop.
+    """
     set_seed(config.seed)
     model, tokenizer = load_base_model(config)
     probe_device = next(model.parameters()).device
@@ -165,7 +173,7 @@ def train(config: ProbeConfig):
             t0 = time.time()
 
             for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
-                # activations already collected by OnTheFlyLoader
+                # On-the-fly: activations were just computed for this batch by OnTheFlyLoader
                 features = batch["activations"].to(probe_device, non_blocking=True)
                 labels   = batch["labels"].to(probe_device, non_blocking=True)
                 mask     = batch["attention_mask"].to(probe_device, non_blocking=True)

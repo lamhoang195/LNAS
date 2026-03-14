@@ -27,6 +27,7 @@ echo "------Starting training---------"
 LNAS_DIR="$(dirname "${SLURM_SUBMIT_DIR}")"
 cd "$LNAS_DIR"
 
+# Single JSONL file or directory of .jsonl files (dataset.load_data supports both)
 TRAIN_DATA="data/train"
 EVAL_DATA="data/test/linear_probe_test"
 CHECKPOINT="checkpoints/best_probe.pt"

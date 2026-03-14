@@ -90,10 +90,12 @@ def make_tokenized_collate_fn(tokenizer, max_length):
     return collate_fn
 
 class OnTheFlyLoader:
-    """Iterator that computes activations inside the training loop (on-the-fly).
-    Per instruction E: computing activations in the loop avoids I/O bottlenecks
-    from moving activation data; probe training is efficient so we can run it
-    on freshly computed activations per batch."""
+    """Iterator that computes activations per batch (on-the-fly), no precomputation.
+
+    Pipeline: batch from DataLoader (input_ids, mask, labels)
+      → LLM forward in collect() → yield {activations, attention_mask, labels}.
+    Used for both training and evaluation so activations are never fully materialized.
+    """
     def __init__(self, dataloader, collector: ActivationCollector, multi_layer: bool = True, return_cpu: bool = False):
         self.dataloader = dataloader
         self.collector = collector

@@ -35,7 +35,8 @@ def evaluate_probe(
 ) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
     """
     Exchange-level prediction uses the max EMA-smoothed logit over the sequence.
-    This matches the streaming deployment path from the write-up.
+    Expects dataloader to yield activation batches (e.g. OnTheFlyLoader);
+    activations are computed on-the-fly during evaluation, no precomputation.
     """
     del collector
     del multi_layer
