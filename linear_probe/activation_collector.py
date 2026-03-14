@@ -1,20 +1,33 @@
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any
 
 class ActivationCollector:
-    def __init__(self, model: nn.Module, target_layers: List[int] = None, device=None):
+    def __init__(self, model: nn.Module, target_layers: Optional[List[int]] = None, device=None):
         self.model = model
         self.target_layers = target_layers or []
         self.device = device or next(model.parameters()).device
 
     def _resolve_layers(self, n_hidden_states: int) -> List[int]:
         if self.target_layers:
-            return self.target_layers
+            resolved_layers = []
+            for layer_idx in self.target_layers:
+                resolved_idx = n_hidden_states + layer_idx if layer_idx < 0 else layer_idx
+                if resolved_idx <= 0 or resolved_idx >= n_hidden_states:
+                    raise ValueError(
+                        f"Layer index {layer_idx} resolves to {resolved_idx}, "
+                        f"but hidden_states has valid indices [1, {n_hidden_states - 1}]"
+                    )
+                resolved_layers.append(resolved_idx)
+            return resolved_layers
         return list(range(1, n_hidden_states))
 
     @torch.no_grad()
     def collect(self, input_ids, attention_mask, multi_layer=True) -> torch.Tensor:
+        input_ids = input_ids.to(self.device, non_blocking=True)
+        attention_mask = attention_mask.to(self.device, non_blocking=True)
+
         out = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -24,11 +37,17 @@ class ActivationCollector:
 
         layers = self._resolve_layers(len(out.hidden_states))
         hidden_states = out.hidden_states
+        selected_states = [hidden_states[layer_idx].detach() for layer_idx in layers]
 
-        if multi_layer and len(layers) > 1:
-            acts = torch.cat([hidden_states[l].detach() for l in layers], dim=-1)
+        if multi_layer and len(selected_states) > 1:
+            # Keep concatenation on one device so device_map="auto" still works.
+            target_device = selected_states[0].device
+            acts = torch.cat(
+                [state if state.device == target_device else state.to(target_device) for state in selected_states],
+                dim=-1,
+            )
         else:
-            acts = hidden_states[layers[0]].detach()
+            acts = selected_states[0]
 
         del hidden_states
         del out
@@ -46,12 +65,12 @@ def make_tokenized_collate_fn(tokenizer, max_length):
                     messages.append({"role": "user", "content": turn["user"]})
                 elif "assistant" in turn:
                     messages.append({"role": "assistant", "content": turn["assistant"]})
-            
+
             try:
                 seq = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             except Exception:
                 seq = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-            
+
             texts.append(seq)
             labels.append(item["label"])
 
@@ -62,15 +81,19 @@ def make_tokenized_collate_fn(tokenizer, max_length):
             max_length=max_length,
             return_tensors="pt"
         )
-        
+
         return {
             "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"],
-            "labels": torch.tensor(labels, dtype=torch.float32)  # shape (B,)
+            "labels": torch.tensor(labels, dtype=torch.float32),
         }
     return collate_fn
 
 class OnTheFlyLoader:
+    """Iterator that computes activations inside the training loop (on-the-fly).
+    Per instruction E: computing activations in the loop avoids I/O bottlenecks
+    from moving activation data; probe training is efficient so we can run it
+    on freshly computed activations per batch."""
     def __init__(self, dataloader, collector: ActivationCollector, multi_layer: bool = True, return_cpu: bool = False):
         self.dataloader = dataloader
         self.collector = collector
@@ -83,18 +106,17 @@ class OnTheFlyLoader:
             attention_mask = batch["attention_mask"]
             labels = batch["labels"]
 
-            # Lên device cho input ở chung 1 chỗ
-            device = next(self.collector.model.parameters()).device
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            labels = labels.to(device)
+            device = self.collector.device
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             activations = self.collector.collect(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 multi_layer=self.multi_layer
             )
-            
+
             if self.return_cpu:
                 activations = activations.cpu()
                 attention_mask = attention_mask.cpu()

@@ -2,10 +2,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model import build_full_window_mask
+
+
+def _select_valid_rows(smoothed_logits, labels, attention_mask, window_size: int):
+    valid = build_full_window_mask(attention_mask, window_size)
+    has_valid = valid.any(dim=1)
+    if not has_valid.any():
+        return None, None, None
+
+    return smoothed_logits[has_valid], valid[has_valid], labels[has_valid].to(dtype=smoothed_logits.dtype)
+
 
 class SoftmaxWeightedBCELoss(nn.Module):
     def __init__(self, temperature: float = 1.0, window_size: int = 16):
         super().__init__()
+        if temperature <= 0.0:
+            raise ValueError("temperature must be > 0")
         self.tau = temperature
         self.M = window_size
 
@@ -18,30 +31,18 @@ class SoftmaxWeightedBCELoss(nn.Module):
         Returns:
             Scalar loss
         """
-        am_bool = attention_mask.bool()  # cast once to avoid repeated alloc
-        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
-        
-        # Ensure sequences smaller than M are not ignored by evaluating their last valid token
-        seq_lens = attention_mask.sum(dim=1, keepdim=True)
-        valid_threshold = torch.clamp(seq_lens, max=self.M)
-        
-        valid = (content_pos >= valid_threshold) & am_bool
-
-        has_valid = valid.any(dim=1)
-        if not has_valid.any():
+        sl, valid, y = _select_valid_rows(smoothed_logits, labels, attention_mask, self.M)
+        if sl is None:
             return smoothed_logits.sum() * 0.0
 
-        sl = smoothed_logits[has_valid]  # new tensor (boolean indexing = copy)
-        v = valid[has_valid]
-        y = labels[has_valid]
-        not_v = ~v  # cache: used twice below
+        not_valid = ~valid
 
         bce = F.binary_cross_entropy_with_logits(
             sl, y.unsqueeze(1).expand_as(sl), reduction="none"
-        ).masked_fill_(not_v, 0.0)  # in-place: output of bce_with_logits is a fresh tensor
+        ).masked_fill_(not_valid, 0.0)
 
-        # divide before mask → 1 tensor allocation instead of 2
-        scaled = (sl / self.tau).masked_fill_(not_v, float("-inf"))
+        # The softmax weighting focuses the loss on the most harmful positions.
+        scaled = (sl / self.tau).masked_fill_(not_valid, float("-inf"))
         weights = F.softmax(scaled, dim=1)
 
         return (weights * bce).sum(dim=1).mean()
@@ -70,24 +71,12 @@ class CumulativeMaxLoss(nn.Module):
         Returns:
             Scalar loss
         """
-        am_bool = attention_mask.bool()
-        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
-        
-        seq_lens = attention_mask.sum(dim=1, keepdim=True)
-        valid_threshold = torch.clamp(seq_lens, max=self.M)
-        valid = (content_pos >= valid_threshold) & am_bool
-
-        has_valid = valid.any(dim=1)
-        if not has_valid.any():
+        sl, valid, y = _select_valid_rows(smoothed_logits, labels, attention_mask, self.M)
+        if sl is None:
             return smoothed_logits.sum() * 0.0
 
-        sl = smoothed_logits[has_valid]
-        v = valid[has_valid]
-        y = labels[has_valid]
-
-        # sigmoid output is saved for its own backward, so masked_fill must be out-of-place
-        # clamp to avoid log(0) = -inf when sigmoid saturates to exactly 1.0 in float32
-        max_prob = torch.sigmoid(sl).masked_fill(~v, 0.0).max(dim=1).values.clamp(1e-7, 1 - 1e-7)
+        valid_logits = sl.masked_fill(~valid, float("-inf"))
+        max_prob = torch.sigmoid(valid_logits).max(dim=1).values.clamp(1e-7, 1 - 1e-7)
 
         return F.binary_cross_entropy(max_prob, y, reduction="mean")
 
@@ -121,35 +110,24 @@ class AnnealedCumulativeMaxLoss(nn.Module):
         """
         omega = min(current_step / self.total_steps, 1.0)
 
-        am_bool = attention_mask.bool()
-        content_pos = attention_mask.float().cumsum(dim=1)  # float cumsum is faster on GPU
-        
-        seq_lens = attention_mask.sum(dim=1, keepdim=True)
-        valid_threshold = torch.clamp(seq_lens, max=self.M)
-        valid = (content_pos >= valid_threshold) & am_bool
-
-        has_valid = valid.any(dim=1)
-        if not has_valid.any():
+        sl, valid, y = _select_valid_rows(smoothed_logits, labels, attention_mask, self.M)
+        if sl is None:
             return smoothed_logits.sum() * 0.0
 
-        sl = smoothed_logits[has_valid]  # new tensor (boolean indexing = copy)
-        v = valid[has_valid]
-        y = labels[has_valid]
-        not_v = ~v  # cache: used twice below
+        not_valid = ~valid
 
-        direct_probs = torch.sigmoid(sl)  # (B, T)
+        direct_probs = torch.sigmoid(sl)
 
-        # sigmoid output saved for backward → masked_fill must be out-of-place
-        cummax_probs = direct_probs.masked_fill(not_v, 0.0).cummax(dim=1).values  # (B, T)
+        # The cumulative branch matches the streaming "stop if ever harmful" decision rule.
+        cummax_probs = direct_probs.masked_fill(not_valid, 0.0).cummax(dim=1).values
 
-        interp_probs = torch.lerp(direct_probs, cummax_probs, omega).clamp_(1e-7, 1 - 1e-7)  # (B, T)
+        interp_probs = torch.lerp(direct_probs, cummax_probs, omega).clamp_(1e-7, 1 - 1e-7)
 
         bce = F.binary_cross_entropy(
             interp_probs,
             y.unsqueeze(1).expand_as(interp_probs),
             reduction="none"
-        ).masked_fill_(not_v, 0.0)  # in-place: bce output is a fresh tensor
+        ).masked_fill_(not_valid, 0.0)
 
-        # normalize by valid token count to avoid penalizing long sequences more
-        valid_counts = v.sum(dim=1).clamp(min=1)
+        valid_counts = valid.sum(dim=1).clamp(min=1)
         return (bce.sum(dim=1) / valid_counts).mean()

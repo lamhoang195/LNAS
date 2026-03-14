@@ -71,6 +71,10 @@ def train(config: ProbeConfig):
     print("Loading data...")
     train_data = load_data(config.train_file)
     eval_data = load_data(config.eval_file)
+    if config.train_fraction < 1.0:
+        n_use = max(1, int(len(train_data) * config.train_fraction))
+        train_data = random.sample(train_data, n_use)
+        print(f"  Train (sampled {config.train_fraction:.0%}): {len(train_data)} samples")
     print(f"  Train: {len(train_data)} | Eval: {len(eval_data)}")
 
     workers = max(config.num_workers, 0)
@@ -80,20 +84,31 @@ def train(config: ProbeConfig):
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(workers > 0),
-        prefetch_factor=(4 if workers > 0 else None),
     )
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
     # DataLoader only tokenizes (safe for CUDA workers); OnTheFlyLoader
     # collects activations in the main process to avoid CUDA fork issues.
     _train_loader_base = DataLoader(train_data, batch_size=config.batch_size, shuffle=True, **loader_kwargs)
     _eval_loader_base  = DataLoader(eval_data,  batch_size=config.batch_size, shuffle=False, **loader_kwargs)
+    
+    # Infer probe input dimension from a single on-the-fly forward pass.
+    # Use a separate small sample to avoid consuming a batch from the training iterator.
+    # This ensures true on-the-fly training without losing any training batches.
+    _sample_loader_base = DataLoader(
+        train_data[:1] if len(train_data) > 0 else train_data,
+        batch_size=1,
+        shuffle=False,
+        **{k: v for k, v in loader_kwargs.items() if k != "prefetch_factor"}
+    )
+    sample_loader = OnTheFlyLoader(_sample_loader_base, collector, multi_layer=multi_layer, return_cpu=False)
+    sample_batch = next(iter(sample_loader))
+    hidden_dim = sample_batch["activations"].shape[-1]
+    del sample_batch, sample_loader, _sample_loader_base
+    print(f"Hidden dim: {hidden_dim}")
+    
     train_loader = OnTheFlyLoader(_train_loader_base, collector, multi_layer=multi_layer, return_cpu=False)
     eval_loader  = OnTheFlyLoader(_eval_loader_base,  collector, multi_layer=multi_layer, return_cpu=False)
-
-    # Infer probe input dimension from a single on-the-fly forward pass.
-    sample_batch = next(iter(train_loader))
-    hidden_dim = sample_batch["activations"].shape[-1]
-    del sample_batch
-    print(f"Hidden dim: {hidden_dim}")
 
     probe = LinearProbe(hidden_dim).to(probe_device)
     smoother = SwIMSmoother(config.window_size).to(probe_device)
@@ -109,7 +124,11 @@ def train(config: ProbeConfig):
 
     use_amp = config.use_amp and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else contextlib.nullcontext()
+    amp_context = (
+        (lambda: torch.amp.autocast("cuda", dtype=torch.bfloat16))
+        if use_amp
+        else contextlib.nullcontext
+    )
     print(f"  AMP: {use_amp}")
 
     if config.loss_type == "cummax":
@@ -151,7 +170,7 @@ def train(config: ProbeConfig):
                 labels   = batch["labels"].to(probe_device, non_blocking=True)
                 mask     = batch["attention_mask"].to(probe_device, non_blocking=True)
 
-                with amp_ctx:
+                with amp_context():
                     smoothed = smoother(probe(features), mask)
                     if config.loss_type == "annealed_cummax":
                         loss = criterion(smoothed, labels, mask, global_step)
@@ -258,6 +277,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--train-data", type=str, default=None)
     parser.add_argument("--eval-data", type=str, default=None)
+    parser.add_argument("--train-fraction", type=float, default=None,
+                        help="Use this fraction of train data (e.g. 0.25 per instruction 5.2)")
     parser.add_argument("--batch-size",         type=int,   default=None)
     parser.add_argument("--loss-type", type=str, default=None,
                         choices=["softmax_weighted", "cummax", "annealed_cummax"])
@@ -270,9 +291,10 @@ if __name__ == "__main__":
     if args.lr: cfg.learning_rate = args.lr
     if args.window_size: cfg.window_size = args.window_size
     if args.temperature: cfg.temperature = args.temperature
-    if args.train_data:  cfg.train_file   = args.train_data
-    if args.eval_data:   cfg.eval_file    = args.eval_data
-    if args.batch_size:         cfg.batch_size         = args.batch_size
+    if args.train_data:      cfg.train_file       = args.train_data
+    if args.eval_data:       cfg.eval_file        = args.eval_data
+    if args.train_fraction is not None: cfg.train_fraction = args.train_fraction
+    if args.batch_size:      cfg.batch_size       = args.batch_size
     if args.loss_type:          cfg.loss_type          = args.loss_type
 
     train(cfg)

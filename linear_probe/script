@@ -39,6 +39,7 @@ echo "Eval data  : $EVAL_DATA"
 
 # A100 80GB: on-the-fly full-layer activations (--layers không truyền = [] trong config = all layers)
 # batch-size nên tune theo VRAM thực tế khi LLM forward + probe cùng lúc.
+# Optional: --train-fraction 0.25 (instruction 5.2: train on ~25% of exchange dataset)
 python linear_probe/train.py \
     --model              "$MODEL" \
     --train-data         "$TRAIN_DATA" \
@@ -54,6 +55,7 @@ echo "------Starting evaluation--------"
 
 python linear_probe/eval.py \
     --checkpoint  "$CHECKPOINT" \
+    --model       "$MODEL" \
     --eval-data   "$EVAL_DATA" \
     --batch-size  32
 
